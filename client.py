@@ -1,73 +1,69 @@
 import asyncio
 import base64
 from pathlib import Path
-# -
+
 # גודל כל חתיכה בבייטים. 1024 בטוח מאוד ל-UDP
 CHUNK_SIZE = 1024
 
 
 class UDPClientProtocol:
-    def __init__(self, file_paths):
-        self.file_paths = file_paths
+    def __init__(self):
+        # הפעם הפרוטוקול לא מקבל רשימת קבצים מראש
         self.transport = None
         self.loop = asyncio.get_running_loop()
+        # נוסיף 'מנעול' (Event) כדי למנוע שליחה של שני קבצים במקביל
+        self.send_in_progress = asyncio.Event()
+        self.send_in_progress.set()  # מתחיל במצב "פנוי"
 
     def connection_made(self, transport):
         self.transport = transport
-        print("Client connected to server")
-        # אנחנו לא רוצים לחסום את connection_made,
-        # אז אנחנו יוצרים "משימה" (task) א-סינכרונית שתרוץ ברקע
-        self.loop.create_task(self.send_files())
+        print("Client connected to server. Ready to send files.")
+        # אנחנו *לא* קוראים אוטומטית ל-send_files
 
-    async def send_files(self):
-        for file_path in self.file_paths:
-            filename = file_path.name
-            print(f"--- Sending file: {filename} ---")
+    async def send_file(self, file_path: Path):
+        # נחכה אם קובץ אחר כבר בתהליך שליחה
+        await self.send_in_progress.wait()
+        # ננעל את המנעול (מצב "עסוק")
+        self.send_in_progress.clear()
 
-            try:
-                # 1. שלח הודעת START
-                start_msg = f"START|{filename}".encode('utf-8')
-                self.transport.sendto(start_msg)
+        filename = file_path.name
+        print(f"--- Sending file: {filename} ---")
 
-                # 2. קרא את הקובץ ושלח חתיכות DATA
-                chunk_index = 0
-                # חשוב: פתיחה במצב 'rb' (read binary)
-                with open(file_path, 'rb') as f:
-                    while True:
-                        chunk = f.read(CHUNK_SIZE)
-                        if not chunk:
-                            break  # סוף הקובץ
+        try:
+            # 1. שלח הודעת START
+            start_msg = f"START|{filename}".encode('utf-8')
+            self.transport.sendto(start_msg)
 
-                        # קודד את החתיכה הבינארית ל-Base64 (שהוא טקסט)
-                        chunk_b64 = base64.b64encode(chunk).decode('utf-8')
+            # 2. קרא את הקובץ ושלח חתיכות DATA
+            chunk_index = 0
+            with open(file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break  # סוף הקובץ
 
-                        data_msg = f"DATA|{filename}|{chunk_b64}".encode('utf-8')
-                        self.transport.sendto(data_msg)
+                    chunk_b64 = base64.b64encode(chunk).decode('utf-8')
+                    data_msg = f"DATA|{filename}|{chunk_b64}".encode('utf-8')
+                    self.transport.sendto(data_msg)
 
-                        if chunk_index % 100 == 0:  # הדפס עדכון כל 100 חבילות
-                            print(f"[{filename}] Sent chunk {chunk_index}...")
+                    if chunk_index % 100 == 0:
+                        print(f"[{filename}] Sent chunk {chunk_index}...")
+                    chunk_index += 1
 
-                        chunk_index += 1
+                    await asyncio.sleep(0.0001)
 
-                        # --- חשוב מאוד ---
-                        # תן "נשימה" קטנה ללולאת האירועים.
-                        # זה מונע הצפה של באפר ה-UDP של מערכת ההפעלה.
-                        await asyncio.sleep(0.0001)
+            # 3. שלח הודעת END
+            end_msg = f"END|{filename}".encode('utf-8')
+            self.transport.sendto(end_msg)
+            print(f"[{filename}] Sent END. Total {chunk_index} chunks.")
 
-                        # 3. שלח הודעת END
-                end_msg = f"END|{filename}".encode('utf-8')
-                self.transport.sendto(end_msg)
-                print(f"[{filename}] Sent END. Total {chunk_index} chunks.")
-
-            except FileNotFoundError:
-                print(f"ERROR: File not found at {file_path}")
-            except Exception as e:
-                print(f"ERROR sending file {file_path.name}: {e}")
-
-        # תן עוד כמה שניות לקבל תשובות מהשרת לפני סגירה
-        await asyncio.sleep(2)
-        print("All files sent. Closing client.")
-        self.transport.close()
+        except FileNotFoundError:
+            print(f"ERROR: File not found at {file_path}")
+        except Exception as e:
+            print(f"ERROR sending file {file_path.name}: {e}")
+        finally:
+            # שחרור המנעול (מצב "פנוי") בכל מקרה
+            self.send_in_progress.set()
 
     def datagram_received(self, data, addr):
         print(f"Received from server: {data.decode()}")
@@ -79,33 +75,51 @@ class UDPClientProtocol:
 async def main():
     loop = asyncio.get_running_loop()
 
+    # עדיין צריך לדעת איפה לחפש את הקבצים
     base_path = Path(r'C:\Users\j4aco\PycharmProjects\AlmogProject\files')
-    files_to_send = [
-        base_path / 'data1.txt',
-        base_path / 'data2.txt'
-    ]
+    print(f"Looking for files in: {base_path}")
 
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: UDPClientProtocol(files_to_send),
+        lambda: UDPClientProtocol(),  # הפרוטוקול נוצר בלי רשימת קבצים
         remote_addr=('127.0.0.1', 9999)
     )
 
-    # הפרוטוקול עצמו יסגור את ה-transport כשיסיים לשלוח
-    # אנחנו רק צריכים לחכות שהפרוטוקול יגמר
-    # ניתן ל-transport "להיסגר" באופן טבעי
     try:
-        # המתנה ארוכה כדי לאפשר לפרוטוקול לרוץ
-        # הפרוטוקול יסגור את ה-transport בעצמו
-        await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass  # הלולאה נסגרת מבחוץ
+        # לולאה אינטראקטיבית לקבלת קלט מהמשתמש
+        while True:
+            # הרצת input() ב-executor כדי לא לחסום את הלולאה
+            prompt = "\n(Type 'exit' to quit)\nEnter file name to send: "
+            filename = await loop.run_in_executor(
+                None,  # השתמש ב-ThreadPoolExecutor הדיפולטי
+                input,  # הפונקציה החוסמת
+                prompt  # הארגומנט שיועבר ל-input
+            )
+
+            if filename.lower() == 'exit':
+                break
+
+            if not filename:
+                continue
+
+            file_path = base_path / filename
+
+            # בדיקה אם הקובץ קיים לפני שמתחילים
+            if not file_path.exists():
+                print(f"File not found: {file_path}")
+                continue
+
+            # קריאה לפונקציה החדשה בפרוטוקול
+            await protocol.send_file(file_path)
+
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        print("\nClient shutting down...")
     finally:
+        print("Closing connection.")
         if transport and not transport.is_closing():
             transport.close()
 
 
 if __name__ == "__main__":
-    # כדי לאפשר לחיצה על Ctrl+C לעצור את הקליינט
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
