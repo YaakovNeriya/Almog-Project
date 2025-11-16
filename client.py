@@ -2,7 +2,7 @@ import asyncio
 import base64
 from pathlib import Path
 
-# גודל כל חתיכה בבייטים. 1024 בטוח מאוד ל-UDP -
+# גודל כל חתיכה בבייטים. 1024 בטוח מאוד ל-UDP 
 CHUNK_SIZE = 1024
 
 
