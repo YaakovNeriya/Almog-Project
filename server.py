@@ -4,13 +4,14 @@ from pathlib import Path
 
 # איפה לשמור קבצים שהתקבלו
 OUTPUT_DIR = Path(r'C:\Users\j4aco\PycharmProjects\AlmogProject\files\received')
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)  # יוצר את התיקייה אם לא קיימת
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-class UDPServerProtocol:
+class UDPServerProtocol(asyncio.DatagramProtocol):
     def __init__(self):
+        super().__init__()
         # מילון שיחזיק את כל החלקים של הקבצים שמגיעים
-        # 'filename.txt' -> [chunk1, chunk2, chunk3, ...]
+        # 'filename.txt' -> {0: chunk0, 1: chunk1, 3: chunk3, ...}
         self.file_buffers = {}
 
     def connection_made(self, transport):
@@ -21,46 +22,72 @@ class UDPServerProtocol:
     def datagram_received(self, data, addr):
         try:
             message = data.decode('utf-8')
-            parts = message.split('|', 2)  # פיצול מקסימלי של 3 חלקים
+            parts = message.split('|', 3)  # פיצול מקסימלי של 4 חלקים
             command = parts[0]
-            filename = parts[1]
+            FileName = parts[1]
 
             if command == 'START':
-                print(f"[{filename}] Received START from {addr}")
-                # אתחול באפר חדש (כרשימה) עבור הקובץ
-                self.file_buffers[filename] = []
-                self.transport.sendto(f"ACK_START|{filename}".encode(), addr)
+                print(f"[{FileName}] Received START from {addr}")
+                # אתחול באפר חדש (כמילון) עבור הקובץ
+                self.file_buffers[FileName] = {}
+                self.transport.sendto(f"ACK_START|{FileName}".encode(), addr)
 
             elif command == 'DATA':
-                if filename in self.file_buffers:
-                    # קח את החלק השלישי (המידע) ובצע דיקוד מ-Base64
-                    chunk_data_b64 = parts[2]
-                    chunk_data = base64.b64decode(chunk_data_b64)
+                seq_num = int(parts[2])
+                chunk_data_b64 = parts[3]
 
-                    # הוסף את החתיכה הבינארית לרשימה
-                    self.file_buffers[filename].append(chunk_data)
-                    # הערה: אנחנו *לא* שולחים ACK על כל חבילה כדי שזה יהיה מהיר
-                    # (וזו גם הסיבה שזה לא אמין)
+                if FileName in self.file_buffers:
+                    # בדוק אם כבר קיבלנו את החבילה הזו (למקרה שה-ACK שלנו אבד)
+                    if seq_num not in self.file_buffers[FileName]:
+                        chunk_data = base64.b64decode(chunk_data_b64)
+                        # שמור את החתיכה הבינארית במילון לפי המספר הסידורי
+                        self.file_buffers[FileName][seq_num] = chunk_data
+                        # print(f"[{filename}] Received chunk {seq_num}") # (יכול להציף את הלוג)
+
+                    # שלח ACK ספציפי עבור חבילה זו, גם אם היא כפולה
+                    # (כדי לטפל במקרה שה-ACK הקודם אבד)
+                    self.transport.sendto(f"ACK_DATA|{FileName}|{seq_num}".encode(), addr)
                 else:
-                    print(f"[{filename}] Received DATA without START, ignoring.")
+                    print(f"[{FileName}] Received DATA without START, ignoring.")
 
             elif command == 'END':
-                print(f"[{filename}] Received END from {addr}")
-                if filename in self.file_buffers:
-                    self.save_file(filename, addr)
+                total_chunks = int(parts[2])  # הקליינט יגיד לנו כמה לצפות
+                print(f"[{FileName}] Received END from {addr} (expecting {total_chunks} chunks)")
+                if FileName in self.file_buffers:
+                    self.save_file(FileName, total_chunks, addr)
                 else:
-                    print(f"[{filename}] Received END without START, ignoring.")
+                    print(f"[{FileName}] Received END without START, ignoring.")
 
         except Exception as e:
             print(f"Error processing datagram: {e}")
 
-    def save_file(self, filename, addr):
-        # הרכבת הקובץ מכל החלקים
+    def save_file(self, filename, total_chunks, addr):
         try:
-            full_data = b''.join(self.file_buffers[filename])
+            received_chunks_map = self.file_buffers[filename]
+
+            # בדוק אם יש לנו את כל החלקים
+            if len(received_chunks_map) != total_chunks:
+                # --- Selective Repeat: שלח NACK (Negative Ack) ---
+                missing_chunks = []
+                for i in range(total_chunks):
+                    if i not in received_chunks_map:
+                        missing_chunks.append(str(i))
+
+                missing_str = ",".join(missing_chunks)
+                print(f"❌ [{filename}] Missing {len(missing_chunks)} chunks. Sending NACK_END.")
+                self.transport.sendto(f"NACK_END|{filename}|missing|{missing_str}".encode(), addr)
+                # אל תמחק את הבאפר! חכה שהקליינט ישלח את החסרים
+                return
+
+            # הרכבת הקובץ מכל החלקים *לפי הסדר*
+            full_data_list = []
+            for i in range(total_chunks):
+                full_data_list.append(received_chunks_map[i])
+
+            full_data = b''.join(full_data_list)
             output_path = OUTPUT_DIR / f"received_{filename}"
 
-            # כתיבת הקובץ (במצב בינארי 'wb')
+            # כתיבת הקובץ
             with open(output_path, 'wb') as f:
                 f.write(full_data)
 
@@ -70,13 +97,17 @@ class UDPServerProtocol:
             # שליחת אישור סופי
             self.transport.sendto(f"ACK_END|{filename}|{file_size_mb:.2f}MB".encode(), addr)
 
+        except KeyError as e:
+            # זה יקרה אם `total_chunks` היה 100 אבל חסרה חבילה 50
+            print(f"Error saving file {filename}: Missing chunk {e}")
+            self.transport.sendto(f"ERROR_SAVE|{filename}|Missing chunk {e}".encode(), addr)
         except Exception as e:
             print(f"Error saving file {filename}: {e}")
             self.transport.sendto(f"ERROR_SAVE|{filename}|{e}".encode(), addr)
 
         finally:
-            # ניקוי הבאפר בין אם הצליח או נכשל
-            if filename in self.file_buffers:
+            # ניקוי הבאפר רק אם ההרכבה הצליחה
+            if filename in self.file_buffers and f"ACK_END" in locals().get('ack_msg', ''):
                 del self.file_buffers[filename]
 
 
@@ -88,7 +119,7 @@ async def main():
     )
 
     try:
-        await asyncio.Event().wait()  # דרך מודרנית להשאיר את השרת רץ
+        await asyncio.Event().wait()
     except KeyboardInterrupt:
         print("Server closing...")
         transport.close()
