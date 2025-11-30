@@ -1,10 +1,10 @@
-import asyncio
-import base64
+import asyncio       # Asynchronous I/O (קלט/פלט אסינכרוני)
+import base64        # -Presentation Layer (שכבת הייצוג).
 from pathlib import Path
 
 # --- הגדרות קבועים ---
-CHUNK_SIZE = 512  # גודל כל חתיכה
-WINDOW_SIZE = 50  # (Selective Repeat) גודל החלון
+CHUNK_SIZE = 512          # Maximum Transmission Unit גודל כל חתיכה בביטים
+WINDOW_SIZE = 50          # (Flow Control) גודל החלון
 RETRANSMIT_TIMEOUT = 1.0  # זמן המתנה ל-ACK לפני שליחה חוזרת
 MAX_handshake_RETRIES = 5  # כמה פעמים לנסות לשלוח START לפני שנכשלים
 
@@ -12,7 +12,7 @@ MAX_handshake_RETRIES = 5  # כמה פעמים לנסות לשלוח START לפ�
 class UDPClientProtocol(asyncio.DatagramProtocol):
     def __init__(self):
         super().__init__()
-        self.transport = None
+        self.transport = None # מכינים משתנה שיחזיק את "צינור התקשורת" (ה-Socket).
         self.loop = asyncio.get_running_loop()
 
         # ניהול מצב שליחה
@@ -22,13 +22,14 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
         self.current_send_job = None
 
         # אירועים (Events) לניהול זרימה
-        self.ack_start_event = asyncio.Event()  # <--- חדש: לוודא שהשרת מוכן לקבל
+        self.ack_start_event = asyncio.Event()  #  מוודא שהשרת מוכן לקבל
         self.ack_event = asyncio.Event()  # מתי הגיע ACK כלשהו (כדי להזיז חלון)
         self.final_ack_event = asyncio.Event()  # מתי הקובץ הסתיים בהצלחה
 
         self.base_path = None
 
     def connection_made(self, transport):
+        # פתיחת Socket
         self.transport = transport
         print("Client connected to server. Ready to send files.")
 
@@ -39,10 +40,11 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
                 timer.cancel()
             self.current_send_job = None
 
+    # Demultiplexer - מפצל נתונים נכנסים
     def datagram_received(self, data, addr):
         message = data.decode()
-        # print(f"Received from server: {message}") # אפשר להחזיר לדיבאג
-        parts = message.split('|')
+        print(f"Received from server: {message}")
+        parts = message.split('|') # פירוק ל HERDER
         command = parts[0]
         filename = parts[1]
 
@@ -51,10 +53,10 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
         if not job or job['filename'] != filename:
             return
 
+        # Session Layer
         if command == 'ACK_START':
             print(f"✅ [{filename}] Handshake successful (ACK_START received).")
             self.ack_start_event.set()
-
         elif command == 'ACK_DATA':
             seq_num = int(parts[2])
             if seq_num not in job['acks_received']:
@@ -63,11 +65,9 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
                     job['timers'][seq_num].cancel()
                     del job['timers'][seq_num]
                 self.ack_event.set()
-
         elif command == 'ACK_END':
             print(f"✅ [{filename}] Transfer Confirmed by Server.")
             self.final_ack_event.set()
-
         elif command == 'NACK_END':
             print(f"❌ [{filename}] Received NACK. Resending missing chunks...")
             missing_chunks_str = parts[3]
@@ -76,7 +76,6 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
                 for seq_num in missing_chunks:
                     if seq_num < len(job['chunks']):
                         self._send_chunk(seq_num)
-
             # נסה שוב לסיים
             self.loop.call_later(RETRANSMIT_TIMEOUT, self._send_end_message)
 
@@ -88,23 +87,25 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
         if seq_num in job['acks_received']:
             return
 
+        # Encapsulation
         try:
             filename = job['filename']
             chunk_data = job['chunks'][seq_num]
+            # Presentation Layer
             chunk_b64 = base64.b64encode(chunk_data).decode('utf-8')
-
+            # Transport Layer
             message = f"DATA|{filename}|{seq_num}|{chunk_b64}".encode('utf-8')
-            self.transport.sendto(message)
+            self.transport.sendto(message) # פקודה לשליחת דאטא-גרם בודד
 
-            # ניהול טיימר
+            # אם הטיימר קיים, מבטלים אותו (כי שולחים שוב)
             if seq_num in job['timers']:
                 job['timers'][seq_num].cancel()
 
+            # קביעת טיימר למספר הסידורי הזה לשליחה חוזרת (Selective Repeat)
             job['timers'][seq_num] = self.loop.call_later(
-                RETRANSMIT_TIMEOUT,
-                self._send_chunk,
-                seq_num
-            )
+                RETRANSMIT_TIMEOUT, self._send_chunk,seq_num )
+            print(f"[{filename}] Sent chunk {seq_num}")
+
         except Exception as e:
             print(f"Error sending chunk {seq_num}: {e}")
 
@@ -152,14 +153,14 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
             total_chunks = len(chunks)
             print(f"[{filename}] Loaded {total_chunks} chunks.")
 
-            # 2. אתחול המשימה
+            # 2. יצירת אובייקט שמחזיק את כל המידע על השיחה
             self.current_send_job = {
                 'filename': filename,
                 'chunks': chunks,
-                'total_chunks': total_chunks,
+                'total_chunks':total_chunks,
                 'acks_received': set(),
                 'timers': {},
-                'base': 0,
+                'base': 0,         # החבילה הכי ישנה שעוד לא אושרה
                 'next_seq_num': 0,
                 'end_timer': None
             }
@@ -187,7 +188,7 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
             # 4. === שליחת הנתונים (Selective Repeat) ===
             print(f"[{filename}] Starting Data Transmission...")
             while len(job['acks_received']) < total_chunks:
-                # מילוי החלון
+                # מילוי החלון Pipeline
                 while job['next_seq_num'] < total_chunks and \
                         job['next_seq_num'] < job['base'] + WINDOW_SIZE:
                     self._send_chunk(job['next_seq_num'])
@@ -237,21 +238,22 @@ class UDPClientProtocol(asyncio.DatagramProtocol):
 async def main():
     loop = asyncio.get_running_loop()
 
-    # שים לב: וודא שהנתיב הזה קיים במחשב שלך
+    # וודא שהנתיב הזה קיים במחשב שלך
     base_path = Path(r'C:\Users\j4aco\PycharmProjects\AlmogProject\files')
     if not base_path.exists():
         print(f"Warning: Base path {base_path} does not exist.")
 
     print(f"Looking for files in: {base_path}")
-
+    # הקצאת פורט (Port) ופתיחת ה-Socket.
     transport, protocol = await loop.create_datagram_endpoint(
         lambda: UDPClientProtocol(),
-        remote_addr=('127.0.0.1', 9999)
+        # Network Layer
+        remote_addr=('127.0.0.1', 9999) # Localhost
     )
     protocol.base_path = base_path
 
     try:
-        while True:
+        while True: # Application Layer
             prompt = "\n(Type 'exit' to quit)\nEnter file name to send: "
             filename = await loop.run_in_executor(None, input, prompt)
             filename = filename.strip()
